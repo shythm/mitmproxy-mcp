@@ -329,6 +329,18 @@ async def clear_rules() -> str:
     return "Cleared all interception rules."
 
 
+@mcp.tool()
+async def list_tools() -> str:
+    """List all available tools with their descriptions."""
+    tools = await mcp.list_tools()
+    tool_list = []
+    for tool in tools:
+        tool_list.append(
+            {"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema}
+        )
+    return json.dumps(tool_list, indent=2)
+
+
 # --- API Analysis Tools (Updated for Dicts) ---
 
 
