@@ -221,10 +221,30 @@ class TrafficDB:
         with self._get_conn() as conn:
             conn.execute("DELETE FROM flows")
 
-    def get_all_for_analysis(self, limit: int = 1000) -> List[Dict[str, Any]]:
+    def get_all_for_analysis(
+        self, limit: Optional[int] = None, lightweight: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Fetch flows for analysis.
+
+        Args:
+            limit: Max flows to return. None = all flows.
+            lightweight: If True, only select columns needed for clustering
+                (no bodies). Reduces memory usage for large captures.
+        """
+        if lightweight:
+            cols = "id, url, method, status_code, request_headers, response_headers"
+        else:
+            cols = "*"
+
+        sql = f"SELECT {cols} FROM flows ORDER BY timestamp DESC"
+        params: list = []
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.execute("SELECT * FROM flows ORDER BY timestamp DESC LIMIT ?", (limit,))
+            cursor = conn.execute(sql, params)
             rows = cursor.fetchall()
             results = []
             for row in rows:
@@ -235,14 +255,22 @@ class TrafficDB:
                             "url": row["url"],
                             "method": row["method"],
                             "headers": json.loads(row["request_headers"]),
-                            "body": row["request_body"],
+                            **(
+                                {"body": row["request_body"]}
+                                if not lightweight
+                                else {}
+                            ),
                         },
                         "response": {
                             "status_code": row["status_code"],
                             "headers": json.loads(row["response_headers"])
                             if row["response_headers"]
                             else {},
-                            "body": row["response_body"],
+                            **(
+                                {"body": row["response_body"]}
+                                if not lightweight
+                                else {}
+                            ),
                         }
                         if row["status_code"]
                         else None,
@@ -386,5 +414,7 @@ class TrafficRecorder:
     def clear(self):
         self.db.clear()
 
-    def get_all_for_analysis(self, limit: int = 1000) -> List[Dict[str, Any]]:
-        return self.db.get_all_for_analysis(limit)
+    def get_all_for_analysis(
+        self, limit: Optional[int] = None, lightweight: bool = False
+    ) -> List[Dict[str, Any]]:
+        return self.db.get_all_for_analysis(limit, lightweight=lightweight)
