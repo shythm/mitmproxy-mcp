@@ -306,7 +306,18 @@ class TrafficDB:
         if not flow_ids:
             return []
 
-        cols = ", ".join(columns) if columns else "*"
+        if columns:
+            allowed_cols = {
+                "id", "url", "method", "status_code", "request_headers", 
+                "request_body", "response_headers", "response_body", "timestamp", "size"
+            }
+            invalid_cols = [c for c in columns if c not in allowed_cols]
+            if invalid_cols:
+                raise ValueError(f"Invalid columns requested: {invalid_cols}")
+            cols = ", ".join(columns)
+        else:
+            cols = "*"
+
         placeholders = ",".join(["?"] * len(flow_ids))
         header_fn = _parse_headers_ordered if ordered_headers else _parse_headers
 
