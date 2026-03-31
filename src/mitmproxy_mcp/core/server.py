@@ -269,7 +269,8 @@ async def load_traffic_file(
         [d.strip() for d in scope.split(",") if d.strip()] if scope else None
     )
     try:
-        stats = controller.recorder.db.import_from_file(
+        stats = await asyncio.to_thread(
+            controller.recorder.db.import_from_file,
             file_path, append=append, scope=scope_list
         )
         return json.dumps(

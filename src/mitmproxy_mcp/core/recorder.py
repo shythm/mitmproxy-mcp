@@ -1,4 +1,5 @@
 import json
+import os
 import shlex
 import sqlite3
 import sys
@@ -311,6 +312,15 @@ class TrafficDB:
 
         stats = {"imported": 0, "skipped": 0, "errors": 0}
 
+        if not os.path.exists(file_path):
+            print(f"File not found: {file_path}", file=sys.stderr)
+            return stats
+
+        allowed_exts = ('.har', '.mitm', '.flow')
+        if not any(str(file_path).lower().endswith(ext) for ext in allowed_exts):
+            print(f"Unsupported file extension: {file_path}", file=sys.stderr)
+            return stats
+
         with open(file_path, "rb") as f:
             reader = FlowReader(f)
             for flow in reader.stream():
@@ -321,7 +331,7 @@ class TrafficDB:
 
                     if scope:
                         host = urlparse(flow.request.url).hostname or ""
-                        if not any(d in host for d in scope):
+                        if not any(host == d or host.endswith("." + d) for d in scope):
                             stats["skipped"] += 1
                             continue
 
