@@ -301,6 +301,42 @@ async def inspect_flows(
 
 
 @mcp.tool()
+async def load_traffic_file(
+    file_path: str,
+    append: bool = False,
+    scope: str = None,
+) -> str:
+    """
+    Import flows from a HAR or mitmproxy flow file into the traffic database.
+    After import, all traffic inspection tools work on the imported data.
+    No proxy needs to be running.
+    Args:
+        file_path: Path to .har or .mitm/.flow file
+        append: If True, keep existing traffic. If False (default), clear first.
+        scope: Comma-separated list of domains to filter by during import.
+            Only flows matching these domains are imported.
+    """
+    scope_list = (
+        [d.strip() for d in scope.split(",") if d.strip()] if scope else None
+    )
+    try:
+        stats = await asyncio.to_thread(
+            controller.recorder.db.import_from_file,
+            file_path, append=append, scope=scope_list
+        )
+        return json.dumps(
+            {
+                "status": "ok",
+                "imported": stats["imported"],
+                "skipped": stats["skipped"],
+                "errors": stats["errors"],
+            }
+        )
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool()
 async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: str = None) -> str:
     """
     Extract specific data from a flow's response body using JSONPath or CSS
@@ -315,10 +351,9 @@ async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: s
         return "No matching flow."
 
     response = flow_data.get("response")
-    if not response or not response.get("body"):
+    body_content = response.get("body_preview") if response else None
+    if not body_content:
         return "Flow has no response body."
-
-    body_content = response["body"]
 
     if json_path:
         try:
@@ -392,10 +427,11 @@ async def extract_session_variable(
         return "No matching flow."
 
     response = flow_data.get("response")
-    if not response or not response.get("body"):
+    body_content = response.get("body_preview") if response else None
+    if not body_content:
         return "Flow has no response body."
     try:
-        match = re.search(regex_pattern, response["body"])
+        match = re.search(regex_pattern, body_content)
         if match:
             value = match.group(group_index)
             controller.session_variables[name] = value
