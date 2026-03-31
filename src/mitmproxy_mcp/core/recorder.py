@@ -28,6 +28,18 @@ def _parse_headers(raw: str) -> Dict[str, str]:
     return parsed
 
 
+def _parse_headers_ordered(raw: str) -> List[List[str]]:
+    """Parse stored headers into an ordered list of [key, value] pairs.
+
+    Preserves header ordering and duplicate keys. Used by codegen tools
+    where header order matters (e.g. HTTP fingerprinting).
+    """
+    parsed = json.loads(raw)
+    if isinstance(parsed, list):
+        return parsed
+    return [[k, v] for k, v in parsed.items()]
+
+
 class SimpleRequest:
     def __init__(self, method: str, url: str, headers: Dict[str, str], body: Optional[str]):
         self.method = method
@@ -279,39 +291,72 @@ class TrafficDB:
                 )
             return results
 
-    def get_by_ids(self, flow_ids: List[str]) -> List[Dict[str, Any]]:
+    def get_by_ids(
+        self,
+        flow_ids: List[str],
+        columns: Optional[List[str]] = None,
+        ordered_headers: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Fetch flows by IDs.
+
+        Args:
+            flow_ids: List of flow IDs to fetch.
+            columns: SQL columns to select. None = all columns.
+                Reduces memory when response bodies aren't needed.
+            ordered_headers: If True, return headers as ordered [key, value]
+                pairs instead of dict. Used by codegen for header ordering.
+        """
         if not flow_ids:
             return []
+
+        if columns:
+            allowed_cols = {
+                "id", "url", "method", "status_code", "request_headers", 
+                "request_body", "response_headers", "response_body", "timestamp", "size"
+            }
+            invalid_cols = [c for c in columns if c not in allowed_cols]
+            if invalid_cols:
+                raise ValueError(f"Invalid columns requested: {invalid_cols}")
+            cols = ", ".join(columns)
+        else:
+            cols = "*"
+
         placeholders = ",".join(["?"] * len(flow_ids))
+        header_fn = _parse_headers_ordered if ordered_headers else _parse_headers
+
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
-                f"SELECT * FROM flows WHERE id IN ({placeholders})",
+                f"SELECT {cols} FROM flows WHERE id IN ({placeholders})",
                 flow_ids,
             )
             rows = cursor.fetchall()
+            row_keys = set(rows[0].keys()) if rows else set()
             results = []
             for row in rows:
-                results.append(
-                    {
-                        "id": row["id"],
-                        "request": {
-                            "url": row["url"],
-                            "method": row["method"],
-                            "headers": _parse_headers(row["request_headers"]),
-                            "body": row["request_body"],
-                        },
-                        "response": {
-                            "status_code": row["status_code"],
-                            "headers": _parse_headers(row["response_headers"])
-                            if row["response_headers"]
-                            else {},
-                            "body": row["response_body"],
-                        }
-                        if row["status_code"]
-                        else None,
-                    }
-                )
+                entry: Dict[str, Any] = {"id": row["id"]}
+
+                req: Dict[str, Any] = {}
+                if "url" in row_keys:
+                    req["url"] = row["url"]
+                if "method" in row_keys:
+                    req["method"] = row["method"]
+                if "request_headers" in row_keys and row["request_headers"]:
+                    req["headers"] = header_fn(row["request_headers"])
+                if "request_body" in row_keys:
+                    req["body"] = row["request_body"]
+                if req:
+                    entry["request"] = req
+
+                if "status_code" in row_keys and row["status_code"] is not None:
+                    resp: Dict[str, Any] = {"status_code": row["status_code"]}
+                    if "response_headers" in row_keys and row["response_headers"]:
+                        resp["headers"] = header_fn(row["response_headers"])
+                    if "response_body" in row_keys:
+                        resp["body"] = row["response_body"]
+                    entry["response"] = resp
+
+                results.append(entry)
             return results
 
     def import_from_file(
