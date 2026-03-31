@@ -1,14 +1,43 @@
 import json
+import os
 import shlex
 import sqlite3
 import sys
-from collections import deque  # added
+from collections import deque
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from mitmproxy import http
+from mitmproxy.io import FlowReader
 
 from .scope import ScopeManager
 from .utils import get_safe_text
+
+
+def _parse_headers(raw: str) -> Dict[str, str]:
+    """Parse stored headers into a dict for backward compat.
+
+    Headers are stored as either:
+    - list of [key, value] pairs (new format, preserves order)
+    - dict (legacy format)
+    Returns a dict in both cases. Duplicate keys are collapsed (last wins).
+    """
+    parsed = json.loads(raw)
+    if isinstance(parsed, list):
+        return {k: v for k, v in parsed}
+    return parsed
+
+
+def _parse_headers_ordered(raw: str) -> List[List[str]]:
+    """Parse stored headers into an ordered list of [key, value] pairs.
+
+    Preserves header ordering and duplicate keys. Used by codegen tools
+    where header order matters (e.g. HTTP fingerprinting).
+    """
+    parsed = json.loads(raw)
+    if isinstance(parsed, list):
+        return parsed
+    return [[k, v] for k, v in parsed.items()]
 
 
 class SimpleRequest:
@@ -93,9 +122,21 @@ class TrafficDB:
                     flow.request.url,
                     flow.request.method,
                     status_code,
-                    json.dumps(dict(flow.request.headers)),
+                    json.dumps(
+                        [
+                            [k.decode("latin-1"), v.decode("latin-1")]
+                            for k, v in flow.request.headers.fields
+                        ],
+                    ),
                     req_body,
-                    json.dumps(dict(flow.response.headers)) if flow.response else None,
+                    json.dumps(
+                        [
+                            [k.decode("latin-1"), v.decode("latin-1")]
+                            for k, v in flow.response.headers.fields
+                        ],
+                    )
+                    if flow.response
+                    else None,
                     resp_body,
                     flow.request.timestamp_start,
                     size,
@@ -125,7 +166,7 @@ class TrafficDB:
             for row in rows:
                 content_type = "unknown"
                 if row["response_headers"]:
-                    headers = json.loads(row["response_headers"])
+                    headers = _parse_headers(row["response_headers"])
                     content_type = headers.get(
                         "content-type",
                         headers.get("Content-Type", "unknown"),
@@ -153,8 +194,8 @@ class TrafficDB:
             if not row:
                 return None
 
-            req_headers = json.loads(row["request_headers"])
-            resp_headers = json.loads(row["response_headers"]) if row["response_headers"] else None
+            req_headers = _parse_headers(row["request_headers"])
+            resp_headers = _parse_headers(row["response_headers"]) if row["response_headers"] else None
 
             simple_request = SimpleRequest(
                 method=row["method"],
@@ -254,7 +295,7 @@ class TrafficDB:
                         "request": {
                             "url": row["url"],
                             "method": row["method"],
-                            "headers": json.loads(row["request_headers"]),
+                            "headers": _parse_headers(row["request_headers"]),
                             **(
                                 {"body": row["request_body"]}
                                 if not lightweight
@@ -263,7 +304,7 @@ class TrafficDB:
                         },
                         "response": {
                             "status_code": row["status_code"],
-                            "headers": json.loads(row["response_headers"])
+                            "headers": _parse_headers(row["response_headers"])
                             if row["response_headers"]
                             else {},
                             **(
@@ -278,40 +319,131 @@ class TrafficDB:
                 )
             return results
 
-    def get_by_ids(self, flow_ids: List[str]) -> List[Dict[str, Any]]:
+    def get_by_ids(
+        self,
+        flow_ids: List[str],
+        columns: Optional[List[str]] = None,
+        ordered_headers: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Fetch flows by IDs.
+
+        Args:
+            flow_ids: List of flow IDs to fetch.
+            columns: SQL columns to select. None = all columns.
+                Reduces memory when response bodies aren't needed.
+            ordered_headers: If True, return headers as ordered [key, value]
+                pairs instead of dict. Used by codegen for header ordering.
+        """
         if not flow_ids:
             return []
+
+        if columns:
+            allowed_cols = {
+                "id", "url", "method", "status_code", "request_headers", 
+                "request_body", "response_headers", "response_body", "timestamp", "size"
+            }
+            invalid_cols = [c for c in columns if c not in allowed_cols]
+            if invalid_cols:
+                raise ValueError(f"Invalid columns requested: {invalid_cols}")
+            cols = ", ".join(columns)
+        else:
+            cols = "*"
+
         placeholders = ",".join(["?"] * len(flow_ids))
+        header_fn = _parse_headers_ordered if ordered_headers else _parse_headers
+
         with self._get_conn() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
-                f"SELECT * FROM flows WHERE id IN ({placeholders})",
+                f"SELECT {cols} FROM flows WHERE id IN ({placeholders})",
                 flow_ids,
             )
             rows = cursor.fetchall()
+            row_keys = set(rows[0].keys()) if rows else set()
             results = []
             for row in rows:
-                results.append(
-                    {
-                        "id": row["id"],
-                        "request": {
-                            "url": row["url"],
-                            "method": row["method"],
-                            "headers": json.loads(row["request_headers"]),
-                            "body": row["request_body"],
-                        },
-                        "response": {
-                            "status_code": row["status_code"],
-                            "headers": json.loads(row["response_headers"])
-                            if row["response_headers"]
-                            else {},
-                            "body": row["response_body"],
-                        }
-                        if row["status_code"]
-                        else None,
-                    }
-                )
+                entry: Dict[str, Any] = {"id": row["id"]}
+
+                req: Dict[str, Any] = {}
+                if "url" in row_keys:
+                    req["url"] = row["url"]
+                if "method" in row_keys:
+                    req["method"] = row["method"]
+                if "request_headers" in row_keys and row["request_headers"]:
+                    req["headers"] = header_fn(row["request_headers"])
+                if "request_body" in row_keys:
+                    req["body"] = row["request_body"]
+                if req:
+                    entry["request"] = req
+
+                if "status_code" in row_keys and row["status_code"] is not None:
+                    resp: Dict[str, Any] = {"status_code": row["status_code"]}
+                    if "response_headers" in row_keys and row["response_headers"]:
+                        resp["headers"] = header_fn(row["response_headers"])
+                    if "response_body" in row_keys:
+                        resp["body"] = row["response_body"]
+                    entry["response"] = resp
+
+                results.append(entry)
             return results
+
+    def import_from_file(
+        self,
+        file_path: str,
+        append: bool = False,
+        scope: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Import flows from a HAR or mitmproxy flow file.
+
+        Uses mitmproxy's FlowReader which auto-detects format (HAR if JSON,
+        native tnetstring otherwise).
+
+        Args:
+            file_path: Path to .har or .mitm/.flow file.
+            append: If False, clear existing traffic before import.
+            scope: Optional list of domains to filter by during import.
+
+        Returns:
+            Dict with import stats: {"imported": int, "skipped": int, "errors": int}
+        """
+        if not append:
+            self.clear()
+
+        stats = {"imported": 0, "skipped": 0, "errors": 0}
+
+        if not os.path.exists(file_path):
+            print(f"File not found: {file_path}", file=sys.stderr)
+            return stats
+
+        allowed_exts = ('.har', '.mitm', '.flow')
+        if not any(str(file_path).lower().endswith(ext) for ext in allowed_exts):
+            print(f"Unsupported file extension: {file_path}", file=sys.stderr)
+            return stats
+
+        with open(file_path, "rb") as f:
+            reader = FlowReader(f)
+            for flow in reader.stream():
+                try:
+                    if not isinstance(flow, http.HTTPFlow):
+                        stats["skipped"] += 1
+                        continue
+
+                    if scope:
+                        host = urlparse(flow.request.url).hostname or ""
+                        if not any(host == d or host.endswith("." + d) for d in scope):
+                            stats["skipped"] += 1
+                            continue
+
+                    self.save_flow(flow)
+                    stats["imported"] += 1
+                except Exception as e:
+                    stats["errors"] += 1
+                    print(
+                        f"Skipped flow during import: {e}",
+                        file=sys.stderr,
+                    )
+
+        return stats
 
     def _generate_curl(self, request: SimpleRequest) -> str:
         try:
@@ -343,7 +475,7 @@ class TrafficDB:
             if not row:
                 return None
 
-            headers = json.loads(row["request_headers"])
+            headers = _parse_headers(row["request_headers"])
             return SimpleRequest(
                 method=row["method"],
                 url=row["url"],

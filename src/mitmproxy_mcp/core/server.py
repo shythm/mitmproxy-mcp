@@ -241,12 +241,99 @@ async def get_traffic_summary(limit: int = 20) -> str:
 
 
 @mcp.tool()
-async def inspect_flow(flow_id: str) -> str:
+async def inspect_flow(flow_id: str, full_body: bool = False) -> str:
+    """
+    Get full details of a captured flow.
+    Args:
+        flow_id: The ID of the captured flow
+        full_body: If True, return full request body instead of 2000-char preview
+    """
     logger.debug("inspect_flow", flow_id=flow_id)
     data = controller.recorder.get_flow_detail(flow_id)
     if not data:
         return "Couldn't find that flow."
+    if full_body and data.get("request"):
+        flow_obj = controller.recorder.db.get_flow_object(flow_id)
+        if flow_obj and flow_obj.body is not None:
+            data["request"]["body"] = flow_obj.body
+            data["request"].pop("body_preview", None)
     return json.dumps(data, indent=2)
+
+
+@mcp.tool()
+async def inspect_flows(
+    flow_ids: str,
+    fields: str = None,
+    full_body: bool = False,
+) -> str:
+    """
+    Batch inspect multiple flows in one call. Reduces context usage vs
+    calling inspect_flow N times.
+    Args:
+        flow_ids: Comma-separated list of flow IDs to inspect
+        fields: Comma-separated list of DB columns to select.
+            e.g. "id,url,method,request_headers,request_body" to skip
+            response data. Default: all columns.
+        full_body: If True, return full request body instead of preview
+    """
+    ids = [fid.strip() for fid in flow_ids.split(",") if fid.strip()]
+    columns = (
+        [c.strip() for c in fields.split(",") if c.strip()] if fields else None
+    )
+    # Always include id in columns
+    if columns and "id" not in columns:
+        columns.insert(0, "id")
+
+    results = controller.recorder.db.get_by_ids(
+        ids, columns=columns, ordered_headers=True
+    )
+
+    if full_body and not columns:
+        # Replace truncated previews with full bodies
+        for entry in results:
+            req = entry.get("request")
+            if req:
+                flow_obj = controller.recorder.db.get_flow_object(entry["id"])
+                if flow_obj and flow_obj.body is not None:
+                    req["body"] = flow_obj.body
+
+    return json.dumps(results, indent=2)
+
+
+@mcp.tool()
+async def load_traffic_file(
+    file_path: str,
+    append: bool = False,
+    scope: str = None,
+) -> str:
+    """
+    Import flows from a HAR or mitmproxy flow file into the traffic database.
+    After import, all traffic inspection tools work on the imported data.
+    No proxy needs to be running.
+    Args:
+        file_path: Path to .har or .mitm/.flow file
+        append: If True, keep existing traffic. If False (default), clear first.
+        scope: Comma-separated list of domains to filter by during import.
+            Only flows matching these domains are imported.
+    """
+    scope_list = (
+        [d.strip() for d in scope.split(",") if d.strip()] if scope else None
+    )
+    try:
+        stats = await asyncio.to_thread(
+            controller.recorder.db.import_from_file,
+            file_path, append=append, scope=scope_list
+        )
+        return json.dumps(
+            {
+                "status": "ok",
+                "imported": stats["imported"],
+                "skipped": stats["skipped"],
+                "errors": stats["errors"],
+            }
+        )
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
 
 
 @mcp.tool()
@@ -264,10 +351,9 @@ async def extract_from_flow(flow_id: str, json_path: str = None, css_selector: s
         return "No matching flow."
 
     response = flow_data.get("response")
-    if not response or not response.get("body"):
+    body_content = response.get("body_preview") if response else None
+    if not body_content:
         return "Flow has no response body."
-
-    body_content = response["body"]
 
     if json_path:
         try:
@@ -341,10 +427,11 @@ async def extract_session_variable(
         return "No matching flow."
 
     response = flow_data.get("response")
-    if not response or not response.get("body"):
+    body_content = response.get("body_preview") if response else None
+    if not body_content:
         return "Flow has no response body."
     try:
-        match = re.search(regex_pattern, response["body"])
+        match = re.search(regex_pattern, body_content)
         if match:
             value = match.group(group_index)
             controller.session_variables[name] = value

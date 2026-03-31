@@ -7,7 +7,7 @@ name = "mitmproxy-mcp"
 version = "0.3.1"
 description = "MITM proxy manager with MCP integration"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 license = {text = "MIT"}
 authors = [{ name = "SnapSpecter", email = "snapspecter@outlook.com" }]
 keywords = ["mitmproxy", "mcp", "proxy", "http", "debugging", "api"]
