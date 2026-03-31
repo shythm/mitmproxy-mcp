@@ -883,12 +883,12 @@ def _generate_openapi_spec(
 
 
 @mcp.tool()
-async def export_openapi_spec(domain: str = None, limit: int = 50) -> str:
+async def export_openapi_spec(domain: str = None, limit: int = None) -> str:
     """
     Exports captured API traffic patterns to an OpenAPI v3 JSON specification.
     Args:
         domain: Filter traffic by domain
-        limit: Max number of traffic flows to analyze
+        limit: Max number of traffic flows to analyze. None = all flows.
     """
     patterns_json = await get_api_patterns(domain, limit)
     clusters = json.loads(patterns_json)
@@ -901,14 +901,20 @@ async def export_openapi_spec(domain: str = None, limit: int = 50) -> str:
 
 
 @mcp.tool()
-async def get_api_patterns(domain: str = None, limit: int = 50) -> str:
-    # Fetch flows from DB
-    flows = controller.recorder.get_all_for_analysis(limit * 5)  # Fetch more to filter locally
+async def get_api_patterns(domain: str = None, limit: int = None) -> str:
+    """
+    Cluster captured traffic into endpoint patterns.
+    Args:
+        domain: Filter traffic by domain
+        limit: Max number of flows to analyze. None = all flows.
+    """
+    flows = controller.recorder.get_all_for_analysis(lightweight=True)
 
     if domain:
         flows = [f for f in flows if domain in f["request"]["url"]]
 
-    flows = flows[:limit]  # Re-limit
+    if limit is not None:
+        flows = flows[:limit]
 
     endpoint_clusters: Dict[str, Dict[str, Any]] = {}
 
