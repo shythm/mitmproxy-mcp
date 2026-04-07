@@ -88,8 +88,16 @@ class MitmController:
         if not self.running or not self.master:
             return "The proxy isn't running right now."
         # Explicitly stop all server instances to release the listening port
+        # and close all active connections (keepalive connections otherwise persist)
         ps_addon = self.master.addons.get("proxyserver")
         if ps_addon:
+            for handler in list(ps_addon.connections.values()):
+                try:
+                    for transport_io in list(handler.transports.values()):
+                        if transport_io.writer and not transport_io.writer.is_closing():
+                            transport_io.writer.close()
+                except Exception:
+                    pass
             for instance in list(ps_addon.servers._instances.values()):
                 try:
                     await instance.stop()
